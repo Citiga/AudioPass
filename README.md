@@ -1,10 +1,10 @@
 # AudioPass
 
-AudioPass sends a microphone through a chain of VST2 and VST3 plugins and routes the signal to a virtual cable or a WAV file. Other applications record the processed signal from the cable's output, for example the "CABLE Output" of a VB-Cable.
-
-The window stays small on purpose: input, output, levels, gain, and the plugin chain.
+AudioPass sends an input device through a chain of VST2 and VST3 plugins and writes the result to one output: a playback device or a WAV file. Other applications hear that output only through the device's loopback entry, for example "Loop-back 1/2 (loopback)" on an Audient iD4 or "CABLE Output" when using VB-Cable.
 
 ![AudioPass 0.90](docs/screenshot.png)
+
+Plugins in the screenshot are examples only and are not included with AudioPass.
 
 ## Using AudioPass
 
@@ -52,31 +52,7 @@ The executable is `build\bin\Release\AudioPass.exe`. The same steps are in `buil
 
 ## License
 
-The AudioPass source is released under the MIT License.
-
-```
-MIT License
-
-Copyright (c) 2026 Citiga
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+The AudioPass source is released under the [MIT License](LICENSE.md).
 
 wxWidgets, the libraries built into it, and the VST 3 SDK keep their own licenses. The texts are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
