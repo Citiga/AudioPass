@@ -1,0 +1,7 @@
+/build/
+/out/
+/.vs/
+/CMakeUserPresets.json
+*.user
+/third_party/wxWidgets/
+/third_party/vst3sdk/
