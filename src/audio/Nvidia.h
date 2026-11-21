@@ -18,8 +18,8 @@ NvidiaSupport probeNvidia();
 
 // Noise removal and room echo removal. The DLL is loaded only when an effect is opened,
 // so AudioPass still runs when the SDK is not installed.
-// open() and close() run on the UI thread while the audio thread is not inside process().
-// process() runs on the audio thread.
+// open() and close() run on the UI thread. close() waits until process() has returned.
+// process() runs on the audio thread. It returns 0, or an NvAFX_Run error after silencing the block.
 class NvidiaFilter {
 public:
     NvidiaFilter() = default;
@@ -30,10 +30,12 @@ public:
 
     bool open(int deviceRate, bool noise, bool room, std::string& error);
     void close();
-    bool active() const { return active_; }
+    bool active() const { return active_.load(std::memory_order_acquire); }
     // 0 leaves the signal unchanged, 1 is the full effect. Safe to call while process() runs.
     void setIntensity(float ratio);
-    void process(float* left, float* right, int frames);
+    // 0 on success, or when the effect is not open. A non-zero value is an NvAFX_Run failure
+    // and the block has been silenced.
+    int process(float* left, float* right, int frames);
 
 private:
     struct Api;
@@ -43,7 +45,7 @@ private:
     bool loadApi(std::string& error);
     bool openStage(Stage& stage, const char* effect, const std::wstring& model, int modelRate, std::string& error);
     void destroyStage(Stage& stage);
-    void pushChain(const float* samples, int count);
+    int pushChain(const float* samples, int count);
     void applyIntensity();
 
     Api* api_ = nullptr;
@@ -53,7 +55,11 @@ private:
     Shift* toDevice_ = nullptr;
     int deviceRate_ = 0;
     int modelRate_ = 0;
-    bool active_ = false;
+    std::atomic<bool> active_{false};
+    // process() calls on the stack. close() waits for zero before it frees an effect.
+    std::atomic<int> busy_{0};
+    // Sticky NvAFX_Run status. 0 is success. Cleared by close().
+    std::atomic<int> runStatus_{0};
     std::atomic<int> intensityPercent_{100};
     int appliedPercent_ = -1;
     std::vector<float> out_;

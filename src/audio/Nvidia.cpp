@@ -1,9 +1,11 @@
 #include "audio/Nvidia.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <thread>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
@@ -262,7 +264,8 @@ struct NvidiaFilter::Stage {
     size_t read = 0;
     std::vector<float> frameOut;
 
-    void push(const float* samples, int count, std::vector<float>& produced, Api::Run run) {
+    // 0 on success. A non-zero NvAFX_Run status leaves the failed frame unprocessed and unwritten.
+    int push(const float* samples, int count, std::vector<float>& produced, Api::Run run) {
         if (samples != nullptr && count > 0) {
             pending.insert(pending.end(), samples, samples + count);
         }
@@ -270,17 +273,18 @@ struct NvidiaFilter::Stage {
             const float* input = pending.data() + read;
             const float* inputs[] = {input};
             float* outputs[] = {frameOut.data()};
-            if (run == nullptr || effect == nullptr || run(effect, inputs, outputs, frame, 1) != 0) {
-                produced.insert(produced.end(), input, input + frame);
-            } else {
-                produced.insert(produced.end(), frameOut.begin(), frameOut.end());
+            const int status = (run == nullptr || effect == nullptr) ? -1 : run(effect, inputs, outputs, frame, 1);
+            if (status != 0) {
+                return status;
             }
+            produced.insert(produced.end(), frameOut.begin(), frameOut.end());
             read += frame;
         }
         if (read > 4096 && read * 2 > pending.size()) {
             pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(read));
             read = 0;
         }
+        return 0;
     }
 };
 
@@ -516,7 +520,8 @@ bool NvidiaFilter::open(int deviceRate, bool noise, bool room, std::string& erro
     out_.assign(static_cast<size_t>(std::max(deviceDelay, 1)), 0.f);
     outRead_ = 0;
     appliedPercent_ = intensityPercent_.load(std::memory_order_relaxed);
-    active_ = true;
+    runStatus_.store(0, std::memory_order_relaxed);
+    active_.store(true, std::memory_order_seq_cst);
     return true;
 }
 
@@ -541,7 +546,10 @@ void NvidiaFilter::applyIntensity() {
 }
 
 void NvidiaFilter::close() {
-    active_ = false;
+    active_.store(false, std::memory_order_seq_cst);
+    while (busy_.load(std::memory_order_seq_cst) != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     if (room_ != nullptr) {
         destroyStage(*room_);
         delete room_;
@@ -561,9 +569,10 @@ void NvidiaFilter::close() {
     deviceRate_ = 0;
     modelRate_ = 0;
     appliedPercent_ = -1;
+    runStatus_.store(0, std::memory_order_relaxed);
 }
 
-void NvidiaFilter::pushChain(const float* samples, int count) {
+int NvidiaFilter::pushChain(const float* samples, int count) {
     std::vector<float> current(samples, samples + count);
     std::vector<float> next;
     Stage* stages[2] = {room_, noise_};
@@ -574,15 +583,18 @@ void NvidiaFilter::pushChain(const float* samples, int count) {
         }
         any = true;
         next.clear();
-        stage->push(current.data(), static_cast<int>(current.size()), next, api_->run);
+        const int status = stage->push(current.data(), static_cast<int>(current.size()), next, api_->run);
+        if (status != 0) {
+            return status;
+        }
         current.swap(next);
     }
     if (!any) {
-        return;
+        return 0;
     }
     if (toDevice_ == nullptr) {
         out_.insert(out_.end(), current.begin(), current.end());
-        return;
+        return 0;
     }
     toDevice_->push(current.data(), static_cast<int>(current.size()));
     std::vector<float> back(static_cast<size_t>(count) + current.size() + 8);
@@ -590,26 +602,69 @@ void NvidiaFilter::pushChain(const float* samples, int count) {
     if (wrote > 0) {
         out_.insert(out_.end(), back.begin(), back.begin() + wrote);
     }
+    return 0;
 }
 
-void NvidiaFilter::process(float* left, float* right, int frames) {
-    if (!active_ || frames <= 0 || left == nullptr || right == nullptr) {
-        return;
+namespace {
+
+class BusyGuard {
+public:
+    explicit BusyGuard(std::atomic<int>& busy) : busy_(busy) {
+        busy_.fetch_add(1, std::memory_order_seq_cst);
+    }
+    ~BusyGuard() { busy_.fetch_sub(1, std::memory_order_seq_cst); }
+
+    BusyGuard(const BusyGuard&) = delete;
+    BusyGuard& operator=(const BusyGuard&) = delete;
+
+private:
+    std::atomic<int>& busy_;
+};
+
+void silence(float* left, float* right, int frames) {
+    std::fill_n(left, frames, 0.f);
+    std::fill_n(right, frames, 0.f);
+}
+
+} // namespace
+
+int NvidiaFilter::process(float* left, float* right, int frames) {
+    if (frames <= 0 || left == nullptr || right == nullptr) {
+        return 0;
+    }
+    // Enter before reading the effect. close() publishes inactive first, then waits
+    // until this counter drops, so it cannot free an effect this call is using.
+    BusyGuard busy(busy_);
+    if (!active_.load(std::memory_order_seq_cst)) {
+        return 0;
+    }
+    const int prior = runStatus_.load(std::memory_order_acquire);
+    if (prior != 0) {
+        silence(left, right, frames);
+        return prior;
     }
     applyIntensity();
     std::vector<float> mono(static_cast<size_t>(frames));
     for (int i = 0; i < frames; ++i) {
         mono[static_cast<size_t>(i)] = 0.5f * (left[i] + right[i]);
     }
+    int status = 0;
     if (toModel_ == nullptr) {
-        pushChain(mono.data(), frames);
+        status = pushChain(mono.data(), frames);
     } else {
         toModel_->push(mono.data(), frames);
         std::vector<float> model(static_cast<size_t>(frames) * static_cast<size_t>(modelRate_) / static_cast<size_t>(std::max(deviceRate_, 1)) + 16);
         const int count = toModel_->pull(model.data(), static_cast<int>(model.size()));
         if (count > 0) {
-            pushChain(model.data(), count);
+            status = pushChain(model.data(), count);
         }
+    }
+    if (status != 0) {
+        runStatus_.store(status, std::memory_order_release);
+        out_.clear();
+        outRead_ = 0;
+        silence(left, right, frames);
+        return status;
     }
     for (int i = 0; i < frames; ++i) {
         const float sample = outRead_ < out_.size() ? out_[outRead_++] : 0.f;
@@ -620,6 +675,7 @@ void NvidiaFilter::process(float* left, float* right, int frames) {
         out_.erase(out_.begin(), out_.begin() + static_cast<std::ptrdiff_t>(outRead_));
         outRead_ = 0;
     }
+    return 0;
 }
 
 } // namespace bv

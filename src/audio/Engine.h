@@ -61,7 +61,7 @@ public:
     void stop();
     bool running() const { return running_.load(std::memory_order_acquire); }
 
-    // Audio will not touch the chain again until resume().
+    // The render or file thread stays out of the NVIDIA effect and the plugin chain until resume().
     void suspend();
     void resume();
     // While held, the output stays silent and plugins are not called.
@@ -92,6 +92,9 @@ private:
     void fileLoop(std::stop_token stop, std::wstring path, uint32_t requestedFrames);
     void bumpPeak(std::atomic<float>& slot, float peak);
     void filterInput(float* left, float* right, int frames);
+    // Audio thread. True once this thread has observed a suspend request and is outside
+    // the NVIDIA effect and the plugin chain. It will not re-enter until resume().
+    bool acknowledgeSuspend();
 
     std::shared_ptr<ProcessChain> chain_;
     std::unique_ptr<Queues> queues_;
@@ -102,9 +105,11 @@ private:
     void* renderEvent_ = nullptr;
 
     std::atomic<bool> running_{false};
-    std::atomic<bool> suspend_{false};
     std::atomic<bool> hold_{true};
-    std::atomic<bool> idle_{true};
+    // Odd values ask the audio thread to stay out of the effect and the plugin chain.
+    // audioAck_ copies the request only after that thread has left both.
+    std::atomic<uint32_t> suspendRequest_{0};
+    std::atomic<uint32_t> audioAck_{0};
     std::atomic<bool> faulted_{false};
     std::atomic<float> gain_{1.f};
     std::atomic<bool> inputMono_{false};

@@ -551,9 +551,9 @@ bool Engine::start(const EngineConfig& config, const std::shared_ptr<ProcessChai
     opened_ = 0;
     failed_ = 0;
     openError_.clear();
-    suspend_ = false;
+    suspendRequest_.store(0, std::memory_order_relaxed);
+    audioAck_.store(0, std::memory_order_relaxed);
     hold_ = true;
-    idle_ = false;
     sampleRate_ = 0;
     bufferFrames_ = 0;
 
@@ -595,7 +595,7 @@ bool Engine::start(const EngineConfig& config, const std::shared_ptr<ProcessChai
 
 void Engine::stop() {
     running_ = false;
-    suspend_ = false;
+    suspendRequest_.store(0, std::memory_order_release);
     if (captureThread_.joinable()) {
         captureThread_.request_stop();
     }
@@ -623,23 +623,38 @@ void Engine::stop() {
         renderEvent_ = nullptr;
     }
     nvidia_.close();
-    idle_ = true;
+    audioAck_.store(0, std::memory_order_relaxed);
 }
 
 void Engine::suspend() {
-    if (!running_) {
-        idle_ = true;
+    if (!running_.load(std::memory_order_acquire)) {
         return;
     }
-    suspend_.store(true, std::memory_order_release);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (!idle_.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+    uint32_t request = suspendRequest_.load(std::memory_order_seq_cst);
+    while ((request & 1u) == 0) {
+        if (suspendRequest_.compare_exchange_weak(request, request + 1, std::memory_order_seq_cst)) {
+            ++request;
+            break;
+        }
+    }
+    // NvAFX_Run and a plugin buffer can outlast a short poll. Wait until this request
+    // has been acknowledged from outside the effect and the chain, instead of tearing
+    // them down while that work is still on the stack.
+    while (audioAck_.load(std::memory_order_seq_cst) != request) {
+        if (!running_.load(std::memory_order_acquire)) {
+            return;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
 void Engine::resume() {
-    suspend_.store(false, std::memory_order_release);
+    uint32_t request = suspendRequest_.load(std::memory_order_seq_cst);
+    while ((request & 1u) != 0) {
+        if (suspendRequest_.compare_exchange_weak(request, request + 1, std::memory_order_seq_cst)) {
+            break;
+        }
+    }
 }
 
 void Engine::setHold(bool hold) {
@@ -680,9 +695,29 @@ void Engine::setNvidiaIntensity(float intensity) {
 
 void Engine::filterInput(float* left, float* right, int frames) {
     // The NVIDIA effect is the mono mix in front of the VST chain.
-    if (nvidia_.active()) {
-        nvidia_.process(left, right, frames);
+    if (!nvidia_.active()) {
+        return;
     }
+    const int status = nvidia_.process(left, right, frames);
+    if (status == 0) {
+        return;
+    }
+    std::lock_guard lock(faultMu_);
+    if (fault_.empty()) {
+        fault_ = status > 0
+                     ? "The NVIDIA audio effect failed (NvAFX_Run error " + std::to_string(status) + ")."
+                     : "The NVIDIA audio effect failed.";
+    }
+    faulted_.store(true, std::memory_order_release);
+}
+
+bool Engine::acknowledgeSuspend() {
+    const uint32_t request = suspendRequest_.load(std::memory_order_seq_cst);
+    if ((request & 1u) == 0) {
+        return false;
+    }
+    audioAck_.store(request, std::memory_order_seq_cst);
+    return true;
 }
 
 float Engine::takeInputPeak() {
@@ -920,13 +955,13 @@ void Engine::captureLoop(std::stop_token stop, std::wstring deviceId) {
                         converted[i * 2 + 1] = mono;
                     }
                 }
-                if (!nvidiaNoise_.load(std::memory_order_relaxed) && !nvidiaRoom_.load(std::memory_order_relaxed)) {
-                    float peak = 0.f;
-                    for (uint32_t i = 0; i < frames; ++i) {
-                        peak = std::max(peak, std::max(std::abs(converted[i * 2]), std::abs(converted[i * 2 + 1])));
-                    }
-                    bumpPeak(inPeak_, peak);
+                // The microphone, including while NVIDIA is on. The render thread only
+                // sees samples after they leave the queue, and it does not meter while priming.
+                float peak = 0.f;
+                for (uint32_t i = 0; i < frames; ++i) {
+                    peak = std::max(peak, std::max(std::abs(converted[i * 2]), std::abs(converted[i * 2 + 1])));
                 }
+                bumpPeak(inPeak_, peak);
             }
             audio.capture->ReleaseBuffer(frames);
             resampled.clear();
@@ -966,6 +1001,7 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
     const float coeff = 1.f - std::exp(-1.f / (static_cast<float>(audio.pcm.sampleRate) * 0.01f));
 
     while (!stop.stop_requested()) {
+        acknowledgeSuspend();
         const DWORD wait = WaitForSingleObject(static_cast<HANDLE>(renderEvent_), 500);
         if (stop.stop_requested()) {
             break;
@@ -995,22 +1031,17 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
         }
 
         if (hold_.load(std::memory_order_acquire)) {
+            acknowledgeSuspend();
             std::memset(dest, 0, static_cast<size_t>(frames) * audio.format->nBlockAlign);
             levels_.add(audio.pcm.sampleRate, frames, 0.f, 0.0, 0.f, 0.0);
             audio.render->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT);
             continue;
         }
 
-        const bool paused = suspend_.load(std::memory_order_acquire);
-        if (paused) {
-            idle_.store(true, std::memory_order_release);
-        } else {
-            idle_.store(false, std::memory_order_release);
-        }
-
         DWORD outFlags = 0;
         const size_t available = queues_->queue.available();
         if (!queues_->primed.load() && available < target) {
+            acknowledgeSuspend();
             outFlags = AUDCLNT_BUFFERFLAGS_SILENT;
             std::memset(dest, 0, static_cast<size_t>(frames) * audio.format->nBlockAlign);
             levels_.add(audio.pcm.sampleRate, frames, 0.f, 0.0, 0.f, 0.0);
@@ -1029,19 +1060,28 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
                 std::fill(block.begin() + static_cast<std::ptrdiff_t>(got * 2),
                           block.begin() + static_cast<std::ptrdiff_t>(frames * 2), 0.f);
             }
-            BlockLevel inLevel;
             for (UINT32 i = 0; i < frames; ++i) {
                 left[i] = block[i * 2];
                 right[i] = block[i * 2 + 1];
             }
-            if (!paused) {
-                filterInput(left.data(), right.data(), static_cast<int>(frames));
-            }
+            BlockLevel inLevel;
             for (UINT32 i = 0; i < frames; ++i) {
                 noteSample(inLevel, left[i], right[i]);
             }
+            // Before NVIDIA, so the meter stays on the microphone rather than the cleaned signal.
             bumpPeak(inPeak_, inLevel.peak);
-            if (!paused && chain_) {
+            const bool bypassFx = acknowledgeSuspend();
+            const bool ranNvidia = !bypassFx && nvidia_.active();
+            if (!bypassFx) {
+                filterInput(left.data(), right.data(), static_cast<int>(frames));
+            }
+            if (ranNvidia) {
+                inLevel = {};
+                for (UINT32 i = 0; i < frames; ++i) {
+                    noteSample(inLevel, left[i], right[i]);
+                }
+            }
+            if (!bypassFx && chain_) {
                 constexpr int kChunk = 1024;
                 UINT32 done = 0;
                 while (done < frames) {
@@ -1067,6 +1107,7 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
         audio.render->ReleaseBuffer(frames, outFlags);
     }
     audio.client->Stop();
+    acknowledgeSuspend();
     running_ = false;
 }
 
@@ -1180,27 +1221,34 @@ void Engine::fileLoop(std::stop_token stop, std::wstring path, uint32_t requeste
 
     while (!stop.stop_requested()) {
         const bool held = hold_.load(std::memory_order_acquire);
-        const bool paused = suspend_.load(std::memory_order_acquire);
-        idle_.store(paused || held, std::memory_order_release);
         if (held || queues_->queue.available() < frames) {
+            acknowledgeSuspend();
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
 
         queues_->queue.pull(block.data(), frames);
-        BlockLevel inLevel;
         for (uint32_t i = 0; i < frames; ++i) {
             left[i] = block[i * 2];
             right[i] = block[i * 2 + 1];
         }
-        if (!paused) {
-            filterInput(left.data(), right.data(), static_cast<int>(frames));
-        }
+        BlockLevel inLevel;
         for (uint32_t i = 0; i < frames; ++i) {
             noteSample(inLevel, left[i], right[i]);
         }
         bumpPeak(inPeak_, inLevel.peak);
-        if (!paused && chain_) {
+        const bool bypassFx = acknowledgeSuspend();
+        const bool ranNvidia = !bypassFx && nvidia_.active();
+        if (!bypassFx) {
+            filterInput(left.data(), right.data(), static_cast<int>(frames));
+        }
+        if (ranNvidia) {
+            inLevel = {};
+            for (uint32_t i = 0; i < frames; ++i) {
+                noteSample(inLevel, left[i], right[i]);
+            }
+        }
+        if (!bypassFx && chain_) {
             constexpr int kChunk = 1024;
             uint32_t done = 0;
             while (done < frames) {
@@ -1228,6 +1276,7 @@ void Engine::fileLoop(std::stop_token stop, std::wstring path, uint32_t requeste
         }
     }
     wav.close();
+    acknowledgeSuspend();
     running_ = false;
 }
 
