@@ -1,5 +1,7 @@
 #pragma once
 
+#include "audio/Levels.h"
+#include "audio/Nvidia.h"
 #include "plugins/Plugin.h"
 
 #include <atomic>
@@ -67,8 +69,17 @@ public:
 
     void setOutputGainDb(float db);
     void setInputMono(bool mono);
+    // UI thread. Loads or releases the NVIDIA effect. While audio is running and not held,
+    // the render thread is suspended for the load.
+    void setNvidia(bool noise, bool room, float intensity, std::string& error);
+    // UI thread. Updates the loaded effect without reloading the model.
+    void setNvidiaIntensity(float intensity);
     float takeInputPeak();
     float takeOutputPeak();
+    // UI thread. Copies newly published history frames, oldest first.
+    int drainLevels(LevelSample* out, int count);
+    // UI thread. Drops history frames that have not been copied yet.
+    void discardLevels();
     EngineStatus status() const;
     // Empty when the stream is healthy. A non-empty string means the device failed.
     std::string takeFault();
@@ -80,6 +91,7 @@ private:
     void renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t requestedFrames);
     void fileLoop(std::stop_token stop, std::wstring path, uint32_t requestedFrames);
     void bumpPeak(std::atomic<float>& slot, float peak);
+    void filterInput(float* left, float* right, int frames);
 
     std::shared_ptr<ProcessChain> chain_;
     std::unique_ptr<Queues> queues_;
@@ -96,8 +108,12 @@ private:
     std::atomic<bool> faulted_{false};
     std::atomic<float> gain_{1.f};
     std::atomic<bool> inputMono_{false};
+    std::atomic<bool> nvidiaNoise_{false};
+    std::atomic<bool> nvidiaRoom_{false};
+    NvidiaFilter nvidia_;
     std::atomic<float> inPeak_{0.f};
     std::atomic<float> outPeak_{0.f};
+    LevelTap levels_;
     std::atomic<uint32_t> sampleRate_{0};
     std::atomic<uint32_t> bufferFrames_{0};
 

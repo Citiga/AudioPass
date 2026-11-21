@@ -6,7 +6,12 @@
 #include <memory>
 
 #include <wx/dcbuffer.h>
+#include <wx/dcmemory.h>
+#include <wx/filename.h>
+#include <wx/frame.h>
 #include <wx/graphics.h>
+#include <wx/sizer.h>
+#include <wx/stattext.h>
 #include <wx/icon.h>
 #include <wx/iconbndl.h>
 #include <wx/time.h>
@@ -323,7 +328,7 @@ CheckBox::CheckBox(wxWindow* parent, const wxString& label) : wxPanel(parent), l
         Refresh(false);
     });
     Bind(wxEVT_LEFT_UP, [this](wxMouseEvent& event) {
-        if (!GetClientRect().Contains(event.GetPosition())) {
+        if (!IsEnabled() || !GetClientRect().Contains(event.GetPosition())) {
             return;
         }
         SetValue(!checked_);
@@ -370,7 +375,7 @@ void CheckBox::OnPaint(wxPaintEvent&) {
         gc->StrokeLine(left, y + box * 0.50, x + box * 0.42, mid);
         gc->StrokeLine(x + box * 0.42, mid, right, top);
     }
-    gc->SetFont(GetFont(), hover_ || checked_ ? theme::Text() : theme::Muted());
+    gc->SetFont(GetFont(), !IsEnabled() ? theme::Faint() : hover_ || checked_ ? theme::Text() : theme::Muted());
     double tw = 0;
     double th = 0;
     gc->GetTextExtent(label_, &tw, &th);
@@ -547,6 +552,454 @@ void VuMeter::OnPaint(wxPaintEvent&) {
     dc.DrawText(maxText, origin + used - maxExtent.x, digitY);
 }
 
+namespace {
+
+wxColour HistoryIn() { return wxColour(88, 166, 255); }
+wxColour HistoryOut() { return wxColour(242, 140, 56); }
+wxColour HistoryGrid() { return wxColour(26, 64, 46); }
+
+void DrawHistoryGrid(wxDC& dc, int x, int y, int width, int height) {
+    dc.SetClippingRegion(x, y, width, height);
+    dc.SetPen(wxPen(HistoryGrid(), 1));
+    for (int column = x; column < x + width; column += 10) {
+        dc.DrawLine(column, y, column, y + height);
+    }
+    for (int row = y; row < y + height; row += 10) {
+        dc.DrawLine(x, row, x + width, row);
+    }
+    dc.DestroyClippingRegion();
+}
+
+void DrawTrace(wxDC& dc, const wxBitmap& trace, int x, int y) {
+    if (!trace.IsOk()) {
+        return;
+    }
+    // Field-coloured pixels stay transparent, so the grid behind the curves remains visible.
+    wxBitmap copy = trace.GetSubBitmap(wxRect(0, 0, trace.GetWidth(), trace.GetHeight()));
+    copy.SetMask(new wxMask(copy, theme::Field()));
+    dc.DrawBitmap(copy, x, y, true);
+}
+
+float EaseDb(float& state, float value) {
+    if (state < -120.f) {
+        state = value;
+        return state;
+    }
+    // Rise quickly enough to show a compressor, and fall slowly enough that a
+    // single 50 ms bin does not strobe the whole trace.
+    const float coeff = value > state ? 0.55f : 0.22f;
+    state += (value - state) * coeff;
+    return state;
+}
+
+} // namespace
+
+LevelHistory::LevelHistory(wxWindow* parent) : wxPanel(parent) {
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    SetDoubleBuffered(true);
+    SetBackgroundColour(theme::Elevated());
+    SetToolTip("About 50 seconds of input (blue) and output (orange). The thin line is peak, the thick line is RMS. "
+               "A red mark means the peak reached 0 dBFS. New samples enter on the right.");
+    samples_.reserve(static_cast<size_t>(kLevelHistorySeconds * kLevelBinsPerSecond));
+    Bind(wxEVT_PAINT, &LevelHistory::OnPaint, this);
+    RepaintOnResize(this);
+}
+
+void LevelHistory::InvalidateTrace() {
+    traceValid_ = false;
+    fed_ = dropped_;
+    carry_ = 0.f;
+    colCount_ = 0;
+    smoothInPeak_ = smoothInRms_ = smoothOutPeak_ = smoothOutRms_ = -140.f;
+    heldInPeakY_ = heldInRmsY_ = heldOutPeakY_ = heldOutRmsY_ = -1;
+}
+
+void LevelHistory::Append(const LevelSample* samples, int count) {
+    if (snapshot_ || frozen_ || samples == nullptr || count <= 0) {
+        return;
+    }
+    const size_t limit = static_cast<size_t>(kLevelHistorySeconds) * static_cast<size_t>(kLevelBinsPerSecond);
+    samples_.insert(samples_.end(), samples, samples + count);
+    if (samples_.size() > limit) {
+        const size_t extra = samples_.size() - limit;
+        samples_.erase(samples_.begin(), samples_.begin() + static_cast<std::ptrdiff_t>(extra));
+        dropped_ += extra;
+        if (fed_ < dropped_) {
+            InvalidateTrace();
+        }
+    }
+    Refresh(false);
+}
+
+void LevelHistory::Clear() {
+    samples_.clear();
+    dropped_ = 0;
+    InvalidateTrace();
+    Refresh(false);
+}
+
+void LevelHistory::SetTrace(Trace trace) {
+    trace_ = trace;
+    InvalidateTrace();
+    Refresh(false);
+}
+
+void LevelHistory::SetScale(Scale scale) {
+    if (scale == Scale::Db24) {
+        floor_ = -24.f;
+    } else if (scale == Scale::Db36) {
+        floor_ = -36.f;
+    } else {
+        floor_ = -60.f;
+    }
+    ceil_ = 6.f;
+    InvalidateTrace();
+    Refresh(false);
+}
+
+void LevelHistory::SetSnapshot(std::vector<LevelSample> samples, int binsPerSecond) {
+    samples_ = std::move(samples);
+    binsPerSecond_ = binsPerSecond > 0 ? binsPerSecond : kLevelBinsPerSecond;
+    snapshot_ = true;
+    frozen_ = true;
+    dropped_ = 0;
+    InvalidateTrace();
+    Refresh(false);
+}
+
+void LevelHistory::SetFrozen(bool frozen) {
+    frozen_ = frozen;
+}
+
+wxSize LevelHistory::DoGetBestSize() const {
+    return wxSize(FromDIP(200), snapshot_ ? FromDIP(220) : FromDIP(140));
+}
+
+int LevelHistory::DbToY(float db) const {
+    const double span = std::max(1.f, ceil_ - floor_);
+    const double t = std::clamp((static_cast<double>(db) - floor_) / span, 0.0, 1.0);
+    return std::clamp(static_cast<int>(std::lround((traceH_ - 1) * (1.0 - t))), 0, std::max(0, traceH_ - 1));
+}
+
+void LevelHistory::DrawColumn(wxDC& dc, int x, float inPeak, float inRms, float outPeak, float outRms, bool connect) {
+    const bool showPeak = trace_ != Trace::Rms;
+    const bool showRms = trace_ != Trace::Peak;
+    auto link = [&](int& held, int y, const wxColour& colour, int width) {
+        dc.SetPen(wxPen(colour, 1));
+        if (connect && held >= 0 && x > 0) {
+            dc.DrawLine(x - 1, held, x, y);
+        } else {
+            dc.DrawPoint(x, y);
+        }
+        if (width > 1) {
+            const int thick = std::clamp(y - 1, 0, std::max(0, traceH_ - 1));
+            dc.DrawPoint(x, thick);
+        }
+        held = y;
+    };
+    if (showRms) {
+        link(heldInRmsY_, DbToY(inRms), HistoryIn(), 2);
+        link(heldOutRmsY_, DbToY(outRms), HistoryOut(), 2);
+    }
+    if (showPeak) {
+        link(heldInPeakY_, DbToY(inPeak), HistoryIn(), 1);
+        link(heldOutPeakY_, DbToY(outPeak), HistoryOut(), 1);
+    }
+    if (inPeak >= 0.f || outPeak >= 0.f) {
+        dc.SetPen(wxPen(theme::Danger(), 1));
+        const int tick = std::min(traceH_ - 1, std::max(3, FromDIP(5)));
+        dc.DrawLine(x, 0, x, tick);
+    }
+}
+
+void LevelHistory::ScrollCommitted() {
+    if (!traceBitmap_.IsOk() || traceW_ < 2 || colCount_ <= 0) {
+        return;
+    }
+    wxBitmap next(traceW_, traceH_);
+    {
+        wxMemoryDC dst(next);
+        dst.SetPen(*wxTRANSPARENT_PEN);
+        dst.SetBrush(wxBrush(theme::Field()));
+        dst.DrawRectangle(0, 0, traceW_, traceH_);
+        wxMemoryDC src(traceBitmap_);
+        dst.Blit(0, 0, traceW_ - 1, traceH_, &src, 1, 0, wxCOPY);
+        const int x = traceW_ - 2;
+        DrawColumn(dst, x, colInPeak_, colInRms_, colOutPeak_, colOutRms_, true);
+    }
+    traceBitmap_ = next;
+}
+
+void LevelHistory::NoteSample(const LevelSample& raw) {
+    LevelSample sample = raw;
+    if (!snapshot_) {
+        sample.inPeakDb = EaseDb(smoothInPeak_, raw.inPeakDb);
+        sample.inRmsDb = EaseDb(smoothInRms_, raw.inRmsDb);
+        sample.outPeakDb = EaseDb(smoothOutPeak_, raw.outPeakDb);
+        sample.outRmsDb = EaseDb(smoothOutRms_, raw.outRmsDb);
+    }
+    if (colCount_ == 0) {
+        colInPeak_ = sample.inPeakDb;
+        colInRms_ = sample.inRmsDb;
+        colOutPeak_ = sample.outPeakDb;
+        colOutRms_ = sample.outRmsDb;
+    } else {
+        colInPeak_ = std::max(colInPeak_, sample.inPeakDb);
+        colOutPeak_ = std::max(colOutPeak_, sample.outPeakDb);
+        colInRms_ += sample.inRmsDb;
+        colOutRms_ += sample.outRmsDb;
+    }
+    ++colCount_;
+    if (pxPerSample_ <= 0.f || colCount_ <= 0) {
+        return;
+    }
+    carry_ += pxPerSample_;
+    if (carry_ < 1.f) {
+        return;
+    }
+    const float inPeak = colInPeak_;
+    const float outPeak = colOutPeak_;
+    const float inRms = colInRms_ / static_cast<float>(colCount_);
+    const float outRms = colOutRms_ / static_cast<float>(colCount_);
+    while (carry_ >= 1.f) {
+        carry_ -= 1.f;
+        colInPeak_ = inPeak;
+        colOutPeak_ = outPeak;
+        colInRms_ = inRms;
+        colOutRms_ = outRms;
+        colCount_ = 1;
+        ScrollCommitted();
+    }
+    colCount_ = 0;
+}
+
+void LevelHistory::OnPaint(wxPaintEvent&) {
+    // Committed columns live in a bitmap and move left by whole pixels. The grid is
+    // painted on the window first; only the curve pixels are copied over it.
+    // RMS is the thicker stroke; peak is the thin stroke drawn over it.
+    wxAutoBufferedPaintDC dc(this);
+    dc.SetBackground(wxBrush(GetBackgroundColour()));
+    dc.Clear();
+    const wxSize size = GetClientSize();
+    dc.SetFont(theme::Mono(7));
+    const int gutter = dc.GetTextExtent("-60").GetWidth() + FromDIP(8);
+    const int topPad = FromDIP(2);
+    const int bottomPad = FromDIP(18);
+    const int rightPad = FromDIP(6);
+    const int plotX = gutter;
+    const int plotY = topPad;
+    const int plotW = size.x - gutter - rightPad;
+    const int plotH = size.y - topPad - bottomPad;
+    if (plotW < 16 || plotH < 16) {
+        return;
+    }
+    dc.SetBrush(wxBrush(theme::Field()));
+    dc.SetPen(wxPen(theme::Line(), 1));
+    dc.DrawRoundedRectangle(plotX, plotY, plotW, plotH, FromDIP(6));
+
+    const int inset = FromDIP(4);
+    const int bmpX = plotX + inset;
+    const int bmpY = plotY + inset;
+    const int bmpW = std::max(2, plotW - inset * 2);
+    const int bmpH = std::max(2, plotH - inset * 2);
+    if (!traceBitmap_.IsOk() || traceW_ != bmpW || traceH_ != bmpH || !traceValid_) {
+        traceW_ = bmpW;
+        traceH_ = bmpH;
+        traceBitmap_ = wxBitmap(bmpW, bmpH);
+        {
+            wxMemoryDC mem(traceBitmap_);
+            mem.SetPen(*wxTRANSPARENT_PEN);
+            mem.SetBrush(wxBrush(theme::Field()));
+            mem.DrawRectangle(0, 0, bmpW, bmpH);
+            if (snapshot_ && !samples_.empty()) {
+                const int lastX = bmpW - 1;
+                heldInPeakY_ = heldInRmsY_ = heldOutPeakY_ = heldOutRmsY_ = -1;
+                for (int x = 0; x < bmpW; ++x) {
+                    const size_t begin = static_cast<size_t>(x) * samples_.size() / static_cast<size_t>(bmpW);
+                    size_t end = static_cast<size_t>(x + 1) * samples_.size() / static_cast<size_t>(bmpW);
+                    if (end <= begin) {
+                        end = std::min(samples_.size(), begin + 1);
+                    }
+                    float inPeak = -140.f;
+                    float outPeak = -140.f;
+                    float inRms = 0.f;
+                    float outRms = 0.f;
+                    int count = 0;
+                    for (size_t i = begin; i < end && i < samples_.size(); ++i) {
+                        const LevelSample& sample = samples_[i];
+                        if (count == 0) {
+                            inPeak = sample.inPeakDb;
+                            outPeak = sample.outPeakDb;
+                        } else {
+                            inPeak = std::max(inPeak, sample.inPeakDb);
+                            outPeak = std::max(outPeak, sample.outPeakDb);
+                        }
+                        inRms += sample.inRmsDb;
+                        outRms += sample.outRmsDb;
+                        ++count;
+                    }
+                    if (count > 0) {
+                        DrawColumn(mem, x, inPeak, inRms / static_cast<float>(count), outPeak,
+                                   outRms / static_cast<float>(count), x > 0);
+                    }
+                    if (x == lastX) {
+                        break;
+                    }
+                }
+            }
+        }
+        traceValid_ = true;
+        if (!snapshot_) {
+            fed_ = dropped_;
+            carry_ = 0.f;
+            colCount_ = 0;
+            smoothInPeak_ = smoothInRms_ = smoothOutPeak_ = smoothOutRms_ = -140.f;
+            heldInPeakY_ = heldInRmsY_ = heldOutPeakY_ = heldOutRmsY_ = -1;
+            pxPerSample_ = static_cast<float>(std::max(1, bmpW - 1)) /
+                           static_cast<float>(kLevelHistorySeconds * kLevelBinsPerSecond - 1);
+        }
+    }
+    if (!snapshot_) {
+        size_t begin = 0;
+        if (fed_ < dropped_) {
+            fed_ = dropped_;
+        } else {
+            begin = fed_ - dropped_;
+        }
+        for (size_t i = begin; i < samples_.size(); ++i) {
+            NoteSample(samples_[i]);
+            ++fed_;
+        }
+    }
+    DrawHistoryGrid(dc, bmpX, bmpY, bmpW, bmpH);
+    DrawTrace(dc, traceBitmap_, bmpX, bmpY);
+    if (!snapshot_ && (colCount_ > 0 || heldInPeakY_ >= 0 || heldOutPeakY_ >= 0)) {
+        const int savedInPeak = heldInPeakY_;
+        const int savedInRms = heldInRmsY_;
+        const int savedOutPeak = heldOutPeakY_;
+        const int savedOutRms = heldOutRmsY_;
+        const float scale = colCount_ > 0 ? 1.f / static_cast<float>(colCount_) : 1.f;
+        dc.SetDeviceOrigin(bmpX, bmpY);
+        DrawColumn(dc, bmpW - 1, colInPeak_, colInRms_ * scale, colOutPeak_, colOutRms_ * scale, true);
+        dc.SetDeviceOrigin(0, 0);
+        heldInPeakY_ = savedInPeak;
+        heldInRmsY_ = savedInRms;
+        heldOutPeakY_ = savedOutPeak;
+        heldOutRmsY_ = savedOutRms;
+    }
+
+    const bool scale60 = floor_ < -50.f;
+    const bool scale36 = !scale60 && floor_ < -30.f;
+    const float labels60[] = {-60.f, -36.f, -12.f, 0.f, 6.f};
+    const float labels36[] = {-36.f, -24.f, -12.f, 0.f, 6.f};
+    const float labels24[] = {-24.f, -18.f, -12.f, -6.f, 0.f, 6.f};
+    const float* labelDb = scale60 ? labels60 : scale36 ? labels36 : labels24;
+    const int labelCount = scale60 || scale36 ? 5 : 6;
+    dc.SetFont(theme::Mono(7));
+    for (int i = 0; i < labelCount; ++i) {
+        const wxString text = labelDb[i] > 0.f ? wxString::Format("+%.0f", labelDb[i]) : wxString::Format("%.0f", labelDb[i]);
+        const wxSize extent = dc.GetTextExtent(text);
+        const double t = std::clamp((static_cast<double>(labelDb[i]) - floor_) / (ceil_ - floor_), 0.0, 1.0);
+        int y = bmpY + static_cast<int>(std::lround((bmpH - 1) * (1.0 - t))) - extent.GetHeight() / 2;
+        y = std::clamp(y, 0, std::max(0, size.y - extent.GetHeight()));
+        dc.SetTextForeground(labelDb[i] == 0.f ? theme::Muted() : theme::Faint());
+        dc.DrawText(text, gutter - FromDIP(6) - extent.GetWidth(), y);
+    }
+
+    wxString spanText = "50 s";
+    if (snapshot_) {
+        const double seconds = static_cast<double>(samples_.size()) / static_cast<double>(std::max(1, binsPerSecond_));
+        spanText = seconds >= 10.0 ? wxString::Format("%.0f s", seconds) : wxString::Format("%.1f s", seconds);
+    }
+    dc.SetFont(theme::Ui(7));
+    dc.SetTextForeground(theme::Faint());
+    const int timeY = plotY + plotH + FromDIP(2);
+    dc.DrawText(spanText, bmpX, timeY);
+    const wxString rightText = snapshot_ ? wxString("end") : wxString("now");
+    const wxSize nowExtent = dc.GetTextExtent(rightText);
+    dc.DrawText(rightText, bmpX + bmpW - nowExtent.GetWidth(), timeY);
+    dc.SetFont(theme::Ui(7, true));
+    const int swatch = FromDIP(10);
+    const wxSize inExtent = dc.GetTextExtent("In");
+    const wxSize outExtent = dc.GetTextExtent("Out");
+    const int legendW = swatch + FromDIP(4) + inExtent.GetWidth() + FromDIP(10) + swatch + FromDIP(4) + outExtent.GetWidth();
+    int legendX = bmpX + (bmpW - legendW) / 2;
+    const int spanW = dc.GetTextExtent(spanText).GetWidth();
+    if (legendX > bmpX + spanW + FromDIP(8) && legendX + legendW < bmpX + bmpW - nowExtent.GetWidth() - FromDIP(8)) {
+        const int midY = timeY + inExtent.GetHeight() / 2;
+        dc.SetPen(wxPen(HistoryIn(), 2));
+        dc.DrawLine(legendX, midY, legendX + swatch, midY);
+        legendX += swatch + FromDIP(4);
+        dc.SetTextForeground(HistoryIn());
+        dc.DrawText("In", legendX, timeY);
+        legendX += inExtent.GetWidth() + FromDIP(10);
+        dc.SetPen(wxPen(HistoryOut(), 2));
+        dc.DrawLine(legendX, midY, legendX + swatch, midY);
+        legendX += swatch + FromDIP(4);
+        dc.SetTextForeground(HistoryOut());
+        dc.DrawText("Out", legendX, timeY);
+    }
+}
+
+void ShowLevelLog(wxWindow* parent, std::vector<LevelSample> samples, const wxString& path, int binsPerSecond) {
+    auto* frame = new wxFrame(parent, wxID_ANY, "Level history", wxDefaultPosition, wxDefaultSize, wxDEFAULT_FRAME_STYLE);
+    frame->SetBackgroundColour(theme::Bg());
+    frame->SetForegroundColour(theme::Text());
+    frame->SetFont(theme::Ui(10));
+    auto* title = new wxStaticText(frame, wxID_ANY, wxFileName(path).GetFullName());
+    title->SetForegroundColour(theme::Text());
+    title->SetBackgroundColour(theme::Bg());
+    title->SetFont(theme::Ui(12, true));
+    const double seconds = static_cast<double>(samples.size()) / static_cast<double>(std::max(1, binsPerSecond));
+    auto* meta = new wxStaticText(
+        frame, wxID_ANY,
+        wxString::Format("%llu samples, %.1f s", static_cast<unsigned long long>(samples.size()), seconds));
+    meta->SetForegroundColour(theme::Muted());
+    meta->SetBackgroundColour(theme::Bg());
+    meta->SetFont(theme::Mono(8));
+    auto* history = new LevelHistory(frame);
+    history->SetBackgroundColour(theme::Bg());
+    history->SetSnapshot(std::move(samples), binsPerSecond);
+    auto* scale = new ChoiceChips(frame, {"-60", "-36", "-24"});
+    scale->SetBackgroundColour(theme::Bg());
+    auto* mode = new ChoiceChips(frame, {"Both", "Peak", "RMS"});
+    mode->SetBackgroundColour(theme::Bg());
+    scale->onChange = [history](int index) {
+        LevelHistory::Scale choice = LevelHistory::Scale::Db60;
+        if (index == 1) {
+            choice = LevelHistory::Scale::Db36;
+        } else if (index == 2) {
+            choice = LevelHistory::Scale::Db24;
+        }
+        history->SetScale(choice);
+    };
+    mode->onChange = [history](int index) {
+        LevelHistory::Trace choice = LevelHistory::Trace::Both;
+        if (index == 1) {
+            choice = LevelHistory::Trace::Peak;
+        } else if (index == 2) {
+            choice = LevelHistory::Trace::Rms;
+        }
+        history->SetTrace(choice);
+    };
+    auto* tools = new wxBoxSizer(wxHORIZONTAL);
+    tools->Add(scale, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, frame->FromDIP(8));
+    tools->Add(mode, 0, wxALIGN_CENTER_VERTICAL);
+    auto* root = new wxBoxSizer(wxVERTICAL);
+    root->Add(title, 0, wxLEFT | wxRIGHT | wxTOP, frame->FromDIP(16));
+    root->Add(meta, 0, wxLEFT | wxRIGHT, frame->FromDIP(16));
+    root->AddSpacer(frame->FromDIP(4));
+    root->Add(tools, 0, wxLEFT | wxRIGHT | wxTOP, frame->FromDIP(12));
+    root->Add(history, 1, wxEXPAND | wxALL, frame->FromDIP(12));
+    frame->SetSizer(root);
+    frame->SetClientSize(frame->FromDIP(wxSize(760, 420)));
+    frame->SetMinSize(frame->FromDIP(wxSize(480, 320)));
+    frame->CentreOnParent();
+    ApplyDarkChrome(frame);
+    ApplyAppIcon(frame);
+    frame->Show();
+}
+
 GainSlider::GainSlider(wxWindow* parent) : wxPanel(parent) {
     SetBackgroundStyle(wxBG_STYLE_PAINT);
     SetBackgroundColour(parent->GetBackgroundColour());
@@ -620,6 +1073,83 @@ void GainSlider::OnPaint(wxPaintEvent&) {
     gc->StrokeLine(zero, cy - FromDIP(7), zero, cy + FromDIP(7));
     gc->SetPen(*wxTRANSPARENT_PEN);
     gc->SetBrush(wxBrush(db_ > 0.05f ? theme::Warn() : theme::Accent()));
+    const double knob = FromDIP(12);
+    gc->DrawEllipse(x - knob / 2.0, cy - knob / 2.0, knob, knob);
+}
+
+StrengthSlider::StrengthSlider(wxWindow* parent) : wxPanel(parent) {
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    SetBackgroundColour(parent->GetBackgroundColour());
+    SetCursor(wxCursor(wxCURSOR_HAND));
+    SetToolTip("Effect strength. 0% leaves the signal unchanged.");
+    Bind(wxEVT_PAINT, &StrengthSlider::OnPaint, this);
+    RepaintOnResize(this);
+    Bind(wxEVT_LEFT_DOWN, [this](wxMouseEvent& event) {
+        if (!IsEnabled()) {
+            return;
+        }
+        dragging_ = true;
+        CaptureMouse();
+        SetFromX(event.GetX());
+    });
+    Bind(wxEVT_MOTION, [this](wxMouseEvent& event) {
+        if (dragging_) {
+            SetFromX(event.GetX());
+        }
+    });
+    Bind(wxEVT_LEFT_UP, [this](wxMouseEvent&) {
+        if (dragging_ && HasCapture()) {
+            ReleaseMouse();
+        }
+        dragging_ = false;
+    });
+}
+
+void StrengthSlider::SetRatio(float ratio) {
+    ratio_ = std::clamp(ratio, 0.f, 1.f);
+    Refresh(false);
+}
+
+bool StrengthSlider::Enable(bool enable) {
+    const bool changed = wxPanel::Enable(enable);
+    SetCursor(enable ? wxCursor(wxCURSOR_HAND) : wxCursor(wxCURSOR_ARROW));
+    Refresh(false);
+    return changed;
+}
+
+wxSize StrengthSlider::DoGetBestSize() const {
+    return wxSize(FromDIP(180), FromDIP(28));
+}
+
+void StrengthSlider::SetFromX(int x) {
+    const int pad = FromDIP(8);
+    const int width = std::max(1, GetClientSize().x - pad * 2);
+    SetRatio((x - pad) / static_cast<float>(width));
+    if (onChange) {
+        onChange(ratio_);
+    }
+}
+
+void StrengthSlider::OnPaint(wxPaintEvent&) {
+    wxAutoBufferedPaintDC dc(this);
+    dc.SetBackground(wxBrush(GetBackgroundColour()));
+    dc.Clear();
+    std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
+    if (!gc) {
+        return;
+    }
+    const wxSize size = GetClientSize();
+    const int pad = FromDIP(8);
+    const int cy = size.y / 2;
+    const double span = std::max(1, size.x - pad * 2);
+    const double x = pad + static_cast<double>(ratio_) * span;
+    const bool enabled = IsEnabled();
+    gc->SetPen(wxPen(theme::Line(), FromDIP(4)));
+    gc->StrokeLine(pad, cy, size.x - pad, cy);
+    gc->SetPen(wxPen(enabled ? theme::Accent() : theme::Faint(), FromDIP(4)));
+    gc->StrokeLine(pad, cy, x, cy);
+    gc->SetPen(*wxTRANSPARENT_PEN);
+    gc->SetBrush(wxBrush(enabled ? theme::Accent() : theme::Faint()));
     const double knob = FromDIP(12);
     gc->DrawEllipse(x - knob / 2.0, cy - knob / 2.0, knob, knob);
 }

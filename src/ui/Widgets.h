@@ -1,11 +1,13 @@
 #pragma once
 
 #include "Theme.h"
+#include "audio/Levels.h"
 
 #include <functional>
 #include <vector>
 
 #include <wx/bitmap.h>
+#include <wx/dc.h>
 #include <wx/icon.h>
 #include <wx/panel.h>
 #include <wx/scrolwin.h>
@@ -17,6 +19,7 @@ namespace bv {
 
 void ApplyDarkChrome(wxWindow* window);
 void ApplyAppIcon(wxTopLevelWindow* window);
+void ShowLevelLog(wxWindow* parent, std::vector<LevelSample> samples, const wxString& path, int binsPerSecond);
 wxIcon AppIcon(int size);
 wxBitmap AppIconBitmap(int size);
 
@@ -91,6 +94,70 @@ private:
     long long lastTick_ = 0;
 };
 
+class LevelHistory : public wxPanel {
+public:
+    enum class Trace { Both, Peak, Rms };
+    enum class Scale { Db60, Db36, Db24 };
+
+    explicit LevelHistory(wxWindow* parent);
+    // UI thread. `samples` were just drained from the engine.
+    void Append(const LevelSample* samples, int count);
+    void Clear();
+    void SetTrace(Trace trace);
+    // Db60 is -60 to +6 dB, Db36 is -36 to +6 dB, Db24 is -24 to +6 dB.
+    void SetScale(Scale scale);
+    Trace GetTrace() const { return trace_; }
+    Scale GetScale() const {
+        if (floor_ < -50.f) {
+            return Scale::Db60;
+        }
+        if (floor_ < -30.f) {
+            return Scale::Db36;
+        }
+        return Scale::Db24;
+    }
+    void SetSnapshot(std::vector<LevelSample> samples, int binsPerSecond);
+    void SetFrozen(bool frozen);
+    bool Frozen() const { return frozen_; }
+
+private:
+    wxSize DoGetBestSize() const override;
+    void OnPaint(wxPaintEvent& event);
+    void InvalidateTrace();
+    void NoteSample(const LevelSample& sample);
+    void ScrollCommitted();
+    void DrawColumn(wxDC& dc, int x, float inPeak, float inRms, float outPeak, float outRms, bool connect);
+    int DbToY(float db) const;
+    std::vector<LevelSample> samples_;
+    wxBitmap traceBitmap_;
+    Trace trace_ = Trace::Both;
+    float floor_ = -60.f;
+    float ceil_ = 6.f;
+    bool frozen_ = false;
+    bool snapshot_ = false;
+    bool traceValid_ = false;
+    int binsPerSecond_ = kLevelBinsPerSecond;
+    int traceW_ = 0;
+    int traceH_ = 0;
+    size_t fed_ = 0;
+    size_t dropped_ = 0;
+    float carry_ = 0.f;
+    float pxPerSample_ = 0.f;
+    float smoothInPeak_ = -140.f;
+    float smoothInRms_ = -140.f;
+    float smoothOutPeak_ = -140.f;
+    float smoothOutRms_ = -140.f;
+    float colInPeak_ = -140.f;
+    float colInRms_ = -140.f;
+    float colOutPeak_ = -140.f;
+    float colOutRms_ = -140.f;
+    int colCount_ = 0;
+    int heldInPeakY_ = -1;
+    int heldInRmsY_ = -1;
+    int heldOutPeakY_ = -1;
+    int heldOutRmsY_ = -1;
+};
+
 class GainSlider : public wxPanel {
 public:
     explicit GainSlider(wxWindow* parent);
@@ -104,6 +171,23 @@ private:
     void OnPaint(wxPaintEvent& event);
     void SetFromX(int x);
     float db_ = 0.f;
+    bool dragging_ = false;
+};
+
+class StrengthSlider : public wxPanel {
+public:
+    explicit StrengthSlider(wxWindow* parent);
+    float GetRatio() const { return ratio_; }
+    void SetRatio(float ratio);
+    bool Enable(bool enable) override;
+
+    std::function<void(float)> onChange;
+
+private:
+    wxSize DoGetBestSize() const override;
+    void OnPaint(wxPaintEvent& event);
+    void SetFromX(int x);
+    float ratio_ = 1.f;
     bool dragging_ = false;
 };
 

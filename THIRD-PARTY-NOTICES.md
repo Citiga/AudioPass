@@ -1,6 +1,6 @@
 # Third-party notices
 
-AudioPass binds the libraries below into `AudioPass.exe`. Their license terms stay with them. AudioPass's own source is covered by the MIT License in [README.md](README.md).
+AudioPass binds the libraries below into `AudioPass.exe`, except the NVIDIA Audio Effects SDK, which is not included. Their license terms stay with them. AudioPass's own source is covered by the MIT License in [LICENSE.md](LICENSE.md). The same notices are in [README.md](README.md).
 
 wxWidgets 3.2.11 and the VST 3 SDK 3.8.1 are fetched into `third_party` by CMake. They are not part of this repository.
 
@@ -487,3 +487,11 @@ SOFTWARE.
 ```
 
 VST is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries. Use of the name is optional under the SDK licence. AudioPass uses it in the application and in the About box.
+
+The VST 2 host interface in this repository is an independent description of the plugin binary interface. The VST 2 SDK is not included.
+
+## NVIDIA Audio Effects SDK
+
+Not fetched, not linked, and not distributed with AudioPass. Noise removal and room echo removal load `NVAudioEffects.dll` only when the user has already installed NVIDIA's redistributable. The SDK, its models, and NVIDIA's runtime libraries stay under NVIDIA's own license. AudioPass does not grant any license to that software.
+
+NVIDIA is a trademark of NVIDIA Corporation. AudioPass is not sponsored or endorsed by NVIDIA.

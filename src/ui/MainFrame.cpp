@@ -11,6 +11,9 @@
 #include <wx/taskbar.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <ctime>
+#include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <functional>
@@ -23,6 +26,7 @@
 #include <wx/filedlg.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
+#include <wx/utils.h>
 
 namespace bv {
 namespace {
@@ -98,8 +102,8 @@ MainFrame::MainFrame()
     SetBackgroundColour(theme::Bg());
     SetForegroundColour(theme::Text());
     SetFont(theme::Ui(10));
-    SetMinSize(FromDIP(wxSize(560, 640)));
-    SetClientSize(FromDIP(wxSize(560, 760)));
+    SetMinSize(FromDIP(wxSize(560, 780)));
+    SetClientSize(FromDIP(wxSize(560, 900)));
     session_ = loadSession();
     Build();
     LoadDevices();
@@ -138,7 +142,7 @@ void MainFrame::PlaceWindow() {
         }
         return;
     }
-    SetClientSize(FromDIP(wxSize(560, 760)));
+    SetClientSize(FromDIP(wxSize(560, 900)));
     if (wxDisplay::GetCount() == 0) {
         Centre();
         return;
@@ -319,16 +323,129 @@ void MainFrame::Build() {
     routeInner->Add(outputField_, 0, wxEXPAND | wxTOP, FromDIP(6));
     routeInner->Add(outputMeter_, 0, wxEXPAND | wxTOP, FromDIP(8));
     routeInner->Add(outputVu_, 0, wxEXPAND | wxTOP, FromDIP(8));
+    levelHistory_ = new LevelHistory(route);
+    auto* historyScale = new ChoiceChips(route, {"-60", "-36", "-24"});
+    historyScale->SetBackgroundColour(theme::Elevated());
+    historyScale->SetToolTip("Vertical scale, top is +6 dB. -60, -36, and -24 choose the bottom.");
+    auto* historyMode = new ChoiceChips(route, {"Both", "Peak", "RMS"});
+    historyMode->SetBackgroundColour(theme::Elevated());
+    historyMode->SetToolTip("Thin line is peak, thick line is RMS.");
+    auto* levelLoad = new FlatButton(route, "Load", FlatButton::Kind::Quiet);
+    levelLoad->SetToolTip("Open a saved level history in its own window.");
+    levelRecord_ = new FlatButton(route, "Record", FlatButton::Kind::Quiet);
+    levelRecord_->SetToolTip("Write the level history to the folder chosen in Settings.");
+    historyFreeze_ = new CheckBox(route, "Freeze");
+    historyFreeze_->SetBackgroundColour(theme::Elevated());
+    historyFreeze_->SetToolTip("Hold the trace. Audio keeps running.");
+    auto* historyReset = new FlatButton(route, "Reset", FlatButton::Kind::Quiet);
+    historyReset->SetToolTip("Clear the level history.");
+    auto* historyHead = new wxBoxSizer(wxHORIZONTAL);
+    historyHead->Add(Caption(route, "HISTORY"), 0, wxALIGN_CENTER_VERTICAL);
+    historyHead->AddStretchSpacer();
+    historyHead->Add(historyScale, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+    historyHead->Add(historyMode, 0, wxALIGN_CENTER_VERTICAL);
+    auto* historyTools = new wxBoxSizer(wxHORIZONTAL);
+    historyTools->AddStretchSpacer();
+    historyTools->Add(levelLoad, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+    historyTools->Add(levelRecord_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+    historyTools->Add(historyFreeze_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+    historyTools->Add(historyReset, 0, wxALIGN_CENTER_VERTICAL);
+    routeInner->Add(historyHead, 0, wxEXPAND | wxTOP, FromDIP(16));
+    routeInner->Add(historyTools, 0, wxEXPAND | wxTOP, FromDIP(6));
+    routeInner->Add(levelHistory_, 0, wxEXPAND | wxTOP, FromDIP(6));
+    auto* gainDown = new FlatButton(route, "−", FlatButton::Kind::Quiet);
+    auto* gainUp = new FlatButton(route, "+", FlatButton::Kind::Quiet);
+    gainDown->SetToolTip("Lower the gain by 0.5 dB.");
+    gainUp->SetToolTip("Raise the gain by 0.5 dB.");
     auto* gainHead = new wxBoxSizer(wxHORIZONTAL);
     gainHead->Add(Caption(route, "GAIN"), 0, wxALIGN_CENTER_VERTICAL);
     gainHead->AddStretchSpacer();
     gainHead->Add(gainLabel_, 0, wxALIGN_CENTER_VERTICAL);
+    auto* gainRow = new wxBoxSizer(wxHORIZONTAL);
+    gainRow->Add(gainDown, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(8));
+    gainRow->Add(gain_, 1, wxALIGN_CENTER_VERTICAL);
+    gainRow->Add(gainUp, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(8));
     routeInner->Add(gainHead, 0, wxEXPAND | wxTOP, FromDIP(14));
-    routeInner->Add(gain_, 0, wxEXPAND | wxTOP, FromDIP(4));
+    routeInner->Add(gainRow, 0, wxEXPAND | wxTOP, FromDIP(4));
     routeInner->Add(hint_, 0, wxEXPAND | wxTOP, FromDIP(10));
     auto* routePad = new wxBoxSizer(wxVERTICAL);
     routePad->Add(routeInner, 0, wxEXPAND | wxALL, FromDIP(14));
     route->SetSizer(routePad);
+
+    auto* nvidiaCard = new Card(this);
+    const NvidiaSupport nvidia = probeNvidia();
+    noiseBox_ = new CheckBox(nvidiaCard, "Noise removal");
+    roomBox_ = new CheckBox(nvidiaCard, "Room echo removal");
+    noiseBox_->SetBackgroundColour(theme::Elevated());
+    roomBox_->SetBackgroundColour(theme::Elevated());
+    noiseBox_->Enable(nvidia.noise);
+    roomBox_->Enable(nvidia.room);
+    noiseBox_->SetValue(nvidia.noise && session_.nvNoise);
+    roomBox_->SetValue(nvidia.room && session_.nvRoom);
+    const wxString nvidiaUrl = "https://www.nvidia.com/en-us/geforce/broadcasting/broadcast-sdk/resources/";
+    const wxString nvidiaTip = nvidia.sdk
+                                   ? wxString("NVIDIA Broadcast SDK, on a mono mix, before the plugin chain.")
+                                   : wxString("Install the NVIDIA Broadcast SDK to enable this. AudioPass keeps working without it.");
+    noiseBox_->SetToolTip(nvidia.noise ? wxString("Removes background noise before the plugin chain. Requires the NVIDIA Broadcast SDK.") : nvidiaTip);
+    roomBox_->SetToolTip(nvidia.room ? wxString("Removes room echo before the plugin chain. Requires the NVIDIA Broadcast SDK.") : nvidiaTip);
+    auto* nvidiaRow = new wxBoxSizer(wxHORIZONTAL);
+    nvidiaRow->Add(noiseBox_, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, FromDIP(16));
+    nvidiaRow->Add(roomBox_, 0, wxALIGN_CENTER_VERTICAL);
+    strength_ = new StrengthSlider(nvidiaCard);
+    strength_->SetBackgroundColour(theme::Elevated());
+    strength_->SetRatio(session_.nvStrength / 100.f);
+    strength_->Enable(nvidia.sdk);
+    strength_->SetToolTip("How strongly noise and room echo are removed. 0% leaves the signal unchanged.");
+    auto* strengthCaption = new wxStaticText(nvidiaCard, wxID_ANY, "Strength");
+    strengthCaption->SetForegroundColour(theme::Muted());
+    strengthCaption->SetBackgroundColour(theme::Elevated());
+    strengthCaption->SetFont(theme::Ui(8, true));
+    strengthValue_ = new wxStaticText(nvidiaCard, wxID_ANY, wxString::Format("%d%%", session_.nvStrength));
+    strengthValue_->SetForegroundColour(nvidia.sdk ? theme::Text() : theme::Faint());
+    strengthValue_->SetBackgroundColour(theme::Elevated());
+    strengthValue_->SetFont(theme::Mono(9));
+    auto* strengthHead = new wxBoxSizer(wxHORIZONTAL);
+    strengthHead->Add(strengthCaption, 0, wxALIGN_CENTER_VERTICAL);
+    strengthHead->AddStretchSpacer();
+    strengthHead->Add(strengthValue_, 0, wxALIGN_CENTER_VERTICAL);
+    auto* nvidiaLead = new wxStaticText(nvidiaCard, wxID_ANY, "Requires the ");
+    nvidiaLead->SetForegroundColour(theme::Faint());
+    nvidiaLead->SetBackgroundColour(theme::Elevated());
+    nvidiaLead->SetFont(theme::Ui(8));
+    auto* nvidiaLink = new wxStaticText(nvidiaCard, wxID_ANY, "NVIDIA Broadcast SDK");
+    nvidiaLink->SetForegroundColour(theme::Accent());
+    nvidiaLink->SetBackgroundColour(theme::Elevated());
+    wxFont linkFont = theme::Ui(8);
+    linkFont.MakeUnderlined();
+    nvidiaLink->SetFont(linkFont);
+    nvidiaLink->SetCursor(wxCursor(wxCURSOR_HAND));
+    nvidiaLink->SetToolTip(nvidiaUrl);
+    nvidiaLink->Bind(wxEVT_LEFT_UP, [nvidiaUrl](wxMouseEvent&) { wxLaunchDefaultBrowser(nvidiaUrl); });
+    auto* nvidiaHint = new wxBoxSizer(wxHORIZONTAL);
+    nvidiaHint->Add(nvidiaLead, 0, wxALIGN_CENTER_VERTICAL);
+    nvidiaHint->Add(nvidiaLink, 0, wxALIGN_CENTER_VERTICAL);
+    if (nvidia.sdk) {
+        auto* period = new wxStaticText(nvidiaCard, wxID_ANY, ".");
+        period->SetForegroundColour(theme::Faint());
+        period->SetBackgroundColour(theme::Elevated());
+        period->SetFont(theme::Ui(8));
+        nvidiaHint->Add(period, 0, wxALIGN_CENTER_VERTICAL);
+    } else {
+        auto* missing = new wxStaticText(nvidiaCard, wxID_ANY, ". It is not installed.");
+        missing->SetForegroundColour(theme::Faint());
+        missing->SetBackgroundColour(theme::Elevated());
+        missing->SetFont(theme::Ui(8));
+        nvidiaHint->Add(missing, 0, wxALIGN_CENTER_VERTICAL);
+    }
+    auto* nvidiaInner = new wxBoxSizer(wxVERTICAL);
+    nvidiaInner->Add(Caption(nvidiaCard, "NVIDIA"), 0, wxEXPAND);
+    nvidiaInner->Add(nvidiaRow, 0, wxTOP, FromDIP(10));
+    nvidiaInner->Add(strengthHead, 0, wxEXPAND | wxTOP, FromDIP(10));
+    nvidiaInner->Add(strength_, 0, wxEXPAND | wxTOP, FromDIP(4));
+    nvidiaInner->Add(nvidiaHint, 0, wxTOP, FromDIP(4));
+    auto* nvidiaPad = new wxBoxSizer(wxVERTICAL);
+    nvidiaPad->Add(nvidiaInner, 0, wxEXPAND | wxALL, FromDIP(14));
+    nvidiaCard->SetSizer(nvidiaPad);
 
     auto* chainCard = new Card(this);
     auto* chainLabel = Caption(chainCard, "CHAIN");
@@ -377,6 +494,7 @@ void MainFrame::Build() {
     auto* root = new wxBoxSizer(wxVERTICAL);
     root->Add(header, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(16));
     root->Add(route, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(14));
+    root->Add(nvidiaCard, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(12));
     root->Add(chainCard, 1, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, FromDIP(12));
     root->Add(footer, 0, wxEXPAND | wxALL, FromDIP(16));
     SetSizer(root);
@@ -429,12 +547,79 @@ void MainFrame::Build() {
             ToggleRun();
         }
     };
+    historyScale->onChange = [this](int index) {
+        LevelHistory::Scale scale = LevelHistory::Scale::Db60;
+        if (index == 1) {
+            scale = LevelHistory::Scale::Db36;
+        } else if (index == 2) {
+            scale = LevelHistory::Scale::Db24;
+        }
+        levelHistory_->SetScale(scale);
+        Remember();
+    };
+    levelLoad->onClick = [this] { LoadLevelHistoryFile(); };
+    levelRecord_->onClick = [this] {
+        if (levelLog_.isOpen()) {
+            StopLevelLog();
+        } else {
+            StartLevelLog();
+        }
+    };
+    historyMode->onChange = [this](int index) {
+        LevelHistory::Trace trace = LevelHistory::Trace::Both;
+        if (index == 1) {
+            trace = LevelHistory::Trace::Peak;
+        } else if (index == 2) {
+            trace = LevelHistory::Trace::Rms;
+        }
+        levelHistory_->SetTrace(trace);
+        Remember();
+    };
+    const int savedScale = session_.levelFloorDb == 36 ? 1 : session_.levelFloorDb == 24 ? 2 : 0;
+    historyScale->SetSelection(savedScale);
+    levelHistory_->SetScale(savedScale == 1 ? LevelHistory::Scale::Db36
+                                            : savedScale == 2 ? LevelHistory::Scale::Db24
+                                                              : LevelHistory::Scale::Db60);
+    const int savedTrace = std::clamp(session_.levelTrace, 0, 2);
+    historyMode->SetSelection(savedTrace);
+    levelHistory_->SetTrace(savedTrace == 1 ? LevelHistory::Trace::Peak
+                                            : savedTrace == 2 ? LevelHistory::Trace::Rms
+                                                              : LevelHistory::Trace::Both);
+    historyFreeze_->onChange = [this](bool on) { levelHistory_->SetFrozen(on); };
+    noiseBox_->onChange = [this](bool) {
+        ApplyNvidia(true);
+        Remember();
+    };
+    roomBox_->onChange = [this](bool) {
+        ApplyNvidia(true);
+        Remember();
+    };
+    strength_->onChange = [this](float ratio) {
+        const int percent = std::clamp(static_cast<int>(ratio * 100.f + 0.5f), 0, 100);
+        strengthValue_->SetLabel(wxString::Format("%d%%", percent));
+        strengthValue_->SetForegroundColour(theme::Text());
+        engine_.setNvidiaIntensity(ratio);
+        Layout();
+        Remember();
+    };
+    historyReset->onClick = [this] {
+        engine_.discardLevels();
+        levelHistory_->Clear();
+    };
     gain_->onChange = [this](float db) {
         gainLabel_->SetLabel(wxString::Format("%+.1f dB", db));
         engine_.setOutputGainDb(db);
         Layout();
         Remember();
     };
+    auto nudgeGain = [this](float delta) {
+        gain_->SetDb(gain_->GetDb() + delta);
+        if (gain_->onChange) {
+            gain_->onChange(gain_->GetDb());
+        }
+    };
+    gainDown->onClick = [nudgeGain] { nudgeGain(-0.5f); };
+    gainUp->onClick = [nudgeGain] { nudgeGain(0.5f); };
     chainList_->onToggleBypass = [this](int index) {
         if (index < 0 || index >= static_cast<int>(slots_.size())) {
             return;
@@ -494,6 +679,17 @@ void MainFrame::Build() {
         timer_.Stop();
         scanner_.shutdown();
         engine_.stop();
+        if (levelLog_.isOpen()) {
+            LevelSample batch[64];
+            int copied = 0;
+            do {
+                copied = engine_.drainLevels(batch, 64);
+                if (copied > 0) {
+                    WriteLevelLog(batch, copied);
+                }
+            } while (copied == 64);
+            StopLevelLog();
+        }
         for (auto& slot : slots_) {
             if (slot.plugin) {
                 slot.state = slot.plugin->saveState();
@@ -630,8 +826,10 @@ void MainFrame::ToggleRun() {
     }
     const int bufferIndex = bufferChips_->GetSelection();
     config.bufferFrames = bufferIndex == 0 ? 128 : bufferIndex == 2 ? 512 : 256;
+    ApplyNvidia(false);
     std::string error;
     if (!engine_.start(config, chain_, error)) {
+        engine_.discardLevels();
         SetStatus(wxString::FromUTF8(error), true);
         runButton_->SetLabel("Start");
         UpdateRun();
@@ -641,13 +839,19 @@ void MainFrame::ToggleRun() {
     for (auto& slot : slots_) {
         slot.plugin->prepare(rate > 0 ? rate : 48000.0, 1024);
     }
+    ApplyNvidia(true);
     engine_.setHold(false);
+    engine_.discardLevels();
+    historyFreeze_->SetValue(false);
+    levelHistory_->SetFrozen(false);
+    levelHistory_->Clear();
     inputVu_->ResetSession();
     outputVu_->ResetSession();
     runButton_->SetLabel("Stop");
     runButton_->Enable(true);
-    statusError_ = false;
-    OnTick();
+    if (!statusError_) {
+        OnTick();
+    }
 }
 
 void MainFrame::AddInfo(const PluginInfo& info, const std::string& state, bool bypassed) {
@@ -803,6 +1007,19 @@ void MainFrame::Remember() {
     session_.bufferFrames = bufferIndex == 0 ? 128 : bufferIndex == 2 ? 512 : 256;
     session_.gainDb = gain_->GetDb();
     session_.inputMono = inputMode_->GetSelection() == 1;
+    const LevelHistory::Scale scale = levelHistory_->GetScale();
+    session_.levelFloorDb = scale == LevelHistory::Scale::Db24 ? 24 : scale == LevelHistory::Scale::Db36 ? 36 : 60;
+    const LevelHistory::Trace trace = levelHistory_->GetTrace();
+    session_.levelTrace = trace == LevelHistory::Trace::Peak ? 1 : trace == LevelHistory::Trace::Rms ? 2 : 0;
+    if (noiseBox_ != nullptr && noiseBox_->IsEnabled()) {
+        session_.nvNoise = noiseBox_->GetValue();
+    }
+    if (roomBox_ != nullptr && roomBox_->IsEnabled()) {
+        session_.nvRoom = roomBox_->GetValue();
+    }
+    if (strength_ != nullptr && strength_->IsEnabled()) {
+        session_.nvStrength = std::clamp(static_cast<int>(strength_->GetRatio() * 100.f + 0.5f), 0, 100);
+    }
     session_.topMost = topMost_->GetValue();
     if (IsShown() && !IsIconized()) {
         session_.windowMaximized = IsMaximized();
@@ -857,6 +1074,101 @@ void MainFrame::UpdateRun() {
     Layout();
 }
 
+void MainFrame::ApplyNvidia(bool showStatus) {
+    const bool noise = noiseBox_ != nullptr && noiseBox_->IsEnabled() && noiseBox_->GetValue();
+    const bool room = roomBox_ != nullptr && roomBox_->IsEnabled() && roomBox_->GetValue();
+    if (showStatus && engine_.running() && (noise || room)) {
+        SetStatus("Loading NVIDIA audio effect…", false);
+        status_->Update();
+    }
+    std::string error;
+    engine_.setNvidia(noise, room, strength_ != nullptr ? strength_->GetRatio() : 1.f, error);
+    if (!showStatus) {
+        return;
+    }
+    if (!error.empty()) {
+        SetStatus(wxString::FromUTF8(error), true);
+    } else if (statusError_) {
+        SetStatus(engine_.running() ? "Running" : "Stopped", false);
+    }
+}
+
+void MainFrame::StartLevelLog() {
+    if (levelLog_.isOpen()) {
+        return;
+    }
+    if (session_.levelLogDir.empty()) {
+        SetStatus("Choose a level history folder in Settings.", true);
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(session_.levelLogDir, ec);
+    if (ec) {
+        SetStatus("Could not create the level history folder.", true);
+        return;
+    }
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    wchar_t stamp[32];
+    if (localtime_s(&local, &now) != 0 || wcsftime(stamp, 32, L"%Y%m%d-%H%M%S", &local) == 0) {
+        SetStatus("Could not name the level history file.", true);
+        return;
+    }
+    const bool binary = session_.levelLogBinary;
+    const wchar_t* extension = binary ? L".apl" : L".csv";
+    std::filesystem::path path =
+        std::filesystem::path(session_.levelLogDir) / (std::wstring(L"levels-") + stamp + extension);
+    int extra = 2;
+    std::error_code existsEc;
+    while (std::filesystem::exists(path, existsEc) && extra < 100) {
+        path = std::filesystem::path(session_.levelLogDir) /
+               (std::wstring(L"levels-") + stamp + L"-" + std::to_wstring(extra) + extension);
+        ++extra;
+    }
+    std::string error;
+    if (!levelLog_.open(path.wstring(), binary, error)) {
+        SetStatus(wxString::FromUTF8(error), true);
+        return;
+    }
+    levelRecord_->SetLabel("Stop");
+    levelRecord_->SetToolTip(wxString(path.wstring()));
+    Layout();
+    statusError_ = false;
+    SetStatus("Recording " + wxString(path.filename().wstring()), false);
+}
+
+void MainFrame::StopLevelLog() {
+    if (!levelLog_.isOpen()) {
+        return;
+    }
+    levelLog_.close();
+    levelRecord_->SetLabel("Record");
+    levelRecord_->SetToolTip("Write the level history to the folder chosen in Settings.");
+    Layout();
+}
+
+void MainFrame::WriteLevelLog(const LevelSample* samples, int count) {
+    levelLog_.write(samples, count);
+}
+
+void MainFrame::LoadLevelHistoryFile() {
+    const wxString directory = session_.levelLogDir.empty() ? wxString() : wxString(session_.levelLogDir);
+    wxFileDialog dialog(this, "Load level history", directory, wxString(),
+                        "Level history (*.csv;*.apl)|*.csv;*.apl|CSV (*.csv)|*.csv|Binary (*.apl)|*.apl",
+                        wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    std::vector<LevelSample> samples;
+    int binsPerSecond = 0;
+    std::string error;
+    if (!LoadLevelHistory(dialog.GetPath().ToStdWstring(), samples, binsPerSecond, error)) {
+        SetStatus(wxString::FromUTF8(error), true);
+        return;
+    }
+    ShowLevelLog(this, std::move(samples), dialog.GetPath(), binsPerSecond);
+}
+
 void MainFrame::OnTick() {
     const std::string fault = engine_.takeFault();
     if (!fault.empty()) {
@@ -874,14 +1186,36 @@ void MainFrame::OnTick() {
     outputMeter_->SetLevel(outputPeak);
     inputVu_->SetLevel(inputPeak);
     outputVu_->SetLevel(outputPeak);
+    // The timer is the only reader of the level ring. While frozen, drop what
+    // the audio thread published so unfreezing continues live instead of replaying.
+    // A recording still takes those frames, so Freeze does not punch a hole in the file.
+    const bool frozen = levelHistory_->Frozen();
+    if (frozen && !levelLog_.isOpen()) {
+        engine_.discardLevels();
+    } else {
+        LevelSample batch[64];
+        int copied = 0;
+        do {
+            copied = engine_.drainLevels(batch, 64);
+            if (copied > 0) {
+                if (!frozen) {
+                    levelHistory_->Append(batch, copied);
+                }
+                WriteLevelLog(batch, copied);
+            }
+        } while (copied == 64);
+    }
     if (statusError_) {
         return;
     }
     if (engine_.running()) {
         const EngineStatus status = engine_.status();
-        SetStatus(wxString::Format(L"%u Hz  \u2014  %u samples  \u2014  %.1f ms", status.sampleRate, status.bufferFrames,
-                                   status.latencyMs),
-                  false);
+        wxString text = wxString::Format(L"%u Hz  \u2014  %u samples  \u2014  %.1f ms", status.sampleRate, status.bufferFrames,
+                                         status.latencyMs);
+        if (levelLog_.isOpen()) {
+            text += L"  \u2014  recording";
+        }
+        SetStatus(text, false);
         return;
     }
     if (scanner_.scanning()) {

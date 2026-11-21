@@ -110,10 +110,12 @@ set(BV_SOURCES
     src/Seh.cpp
     src/Session.cpp
     src/audio/Engine.cpp
+    src/audio/Nvidia.cpp
     src/plugins/Vst2Plugin.cpp
     src/plugins/Vst3Plugin.cpp
     src/plugins/Scanner.cpp
     src/ui/Widgets.cpp
+    src/ui/LevelFile.cpp
     src/ui/EditorFrame.cpp
     src/ui/PluginPicker.cpp
     src/ui/MainFrame.cpp

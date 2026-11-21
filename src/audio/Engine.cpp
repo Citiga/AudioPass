@@ -430,6 +430,19 @@ void raiseThreadPriority() {
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 }
 
+struct BlockLevel {
+    float peak = 0.f;
+    double sumSq = 0.0;
+};
+
+// Peak is the louder channel. RMS follows that same channel, so a silent side does not pull the level down.
+void noteSample(BlockLevel& level, float left, float right) {
+    level.peak = std::max(level.peak, std::max(std::abs(left), std::abs(right)));
+    const double leftSq = static_cast<double>(left) * left;
+    const double rightSq = static_cast<double>(right) * right;
+    level.sumSq += leftSq > rightSq ? leftSq : rightSq;
+}
+
 } // namespace
 
 void ProcessChain::setPlugins(std::vector<Plugin*> plugins) {
@@ -517,6 +530,7 @@ Engine::~Engine() {
 bool Engine::start(const EngineConfig& config, const std::shared_ptr<ProcessChain>& chain,
                    std::string& error) {
     stop();
+    levels_.resetBin();
     fileOutput_ = config.outputId == kFileOutputId;
     if (config.inputId.empty() || config.outputId.empty()) {
         error = "Choose an input and an output.";
@@ -608,6 +622,7 @@ void Engine::stop() {
         CloseHandle(static_cast<HANDLE>(renderEvent_));
         renderEvent_ = nullptr;
     }
+    nvidia_.close();
     idle_ = true;
 }
 
@@ -639,12 +654,51 @@ void Engine::setInputMono(bool mono) {
     inputMono_.store(mono, std::memory_order_relaxed);
 }
 
+void Engine::setNvidia(bool noise, bool room, float intensity, std::string& error) {
+    const bool live = running_.load(std::memory_order_acquire);
+    const bool held = hold_.load(std::memory_order_acquire);
+    if (live && !held) {
+        suspend();
+    }
+    nvidia_.setIntensity(intensity);
+    nvidiaNoise_.store(noise, std::memory_order_relaxed);
+    nvidiaRoom_.store(room, std::memory_order_relaxed);
+    nvidia_.close();
+    error.clear();
+    const int rate = static_cast<int>(sampleRate_.load(std::memory_order_acquire));
+    if ((noise || room) && rate > 0 && !nvidia_.open(rate, noise, room, error)) {
+        nvidia_.close();
+    }
+    if (live && !held) {
+        resume();
+    }
+}
+
+void Engine::setNvidiaIntensity(float intensity) {
+    nvidia_.setIntensity(intensity);
+}
+
+void Engine::filterInput(float* left, float* right, int frames) {
+    // The NVIDIA effect is the mono mix in front of the VST chain.
+    if (nvidia_.active()) {
+        nvidia_.process(left, right, frames);
+    }
+}
+
 float Engine::takeInputPeak() {
     return inPeak_.exchange(0.f, std::memory_order_relaxed);
 }
 
 float Engine::takeOutputPeak() {
     return outPeak_.exchange(0.f, std::memory_order_relaxed);
+}
+
+int Engine::drainLevels(LevelSample* out, int count) {
+    return levels_.drain(out, count);
+}
+
+void Engine::discardLevels() {
+    levels_.discard();
 }
 
 EngineStatus Engine::status() const {
@@ -670,6 +724,124 @@ void Engine::bumpPeak(std::atomic<float>& slot, float peak) {
     float current = slot.load(std::memory_order_relaxed);
     while (peak > current && !slot.compare_exchange_weak(current, peak, std::memory_order_relaxed)) {
     }
+}
+
+namespace {
+
+// 0 maps to silence (-140 dB), so an empty slot is not a full-scale sample.
+uint16_t encodeDb(float db) {
+    const float clamped = std::clamp(db, -140.f, 40.f);
+    return static_cast<uint16_t>(std::lround((clamped + 140.f) * 10.f));
+}
+
+float decodeDb(uint16_t quantized) {
+    return static_cast<float>(quantized) / 10.f - 140.f;
+}
+
+uint64_t encodeFrame(float inPeakDb, float inRmsDb, float outPeakDb, float outRmsDb) {
+    uint64_t bits = encodeDb(inPeakDb);
+    bits |= static_cast<uint64_t>(encodeDb(inRmsDb)) << 16;
+    bits |= static_cast<uint64_t>(encodeDb(outPeakDb)) << 32;
+    bits |= static_cast<uint64_t>(encodeDb(outRmsDb)) << 48;
+    return bits;
+}
+
+LevelSample decodeFrame(uint64_t bits) {
+    LevelSample sample;
+    sample.inPeakDb = decodeDb(static_cast<uint16_t>(bits));
+    sample.inRmsDb = decodeDb(static_cast<uint16_t>(bits >> 16));
+    sample.outPeakDb = decodeDb(static_cast<uint16_t>(bits >> 32));
+    sample.outRmsDb = decodeDb(static_cast<uint16_t>(bits >> 48));
+    return sample;
+}
+
+float linearToDb(float linear) {
+    if (!(linear > 1.e-7f)) {
+        return -140.f;
+    }
+    return 20.f * std::log10(linear);
+}
+
+} // namespace
+
+LevelTap::LevelTap() {
+    for (auto& slot : slots_) {
+        slot.store(0, std::memory_order_relaxed);
+    }
+}
+
+void LevelTap::add(int sampleRate, uint32_t frames, float inPeak, double inSumSq, float outPeak, double outSumSq) {
+    if (sampleRate <= 0 || frames == 0) {
+        return;
+    }
+    if (sampleRate != rate_) {
+        rate_ = sampleRate;
+        window_ = std::max(1, sampleRate / kLevelBinsPerSecond);
+        inPeak_ = 0.f;
+        outPeak_ = 0.f;
+        inSumSq_ = 0.0;
+        outSumSq_ = 0.0;
+        filled_ = 0;
+    }
+    inPeak_ = std::max(inPeak_, inPeak);
+    outPeak_ = std::max(outPeak_, outPeak);
+    inSumSq_ += inSumSq;
+    outSumSq_ += outSumSq;
+    filled_ += frames;
+    // The block that crosses the window is a few milliseconds long, so the bin
+    // lands between about 50 ms and 50 ms plus one buffer. That stays inside 15-25 Hz.
+    if (filled_ < static_cast<uint32_t>(window_)) {
+        return;
+    }
+    const double framesInBin = static_cast<double>(filled_);
+    const float inRms = inSumSq_ > 0.0 ? static_cast<float>(std::sqrt(inSumSq_ / framesInBin)) : 0.f;
+    const float outRms = outSumSq_ > 0.0 ? static_cast<float>(std::sqrt(outSumSq_ / framesInBin)) : 0.f;
+    publish(linearToDb(inPeak_), linearToDb(inRms), linearToDb(outPeak_), linearToDb(outRms));
+    inPeak_ = 0.f;
+    outPeak_ = 0.f;
+    inSumSq_ = 0.0;
+    outSumSq_ = 0.0;
+    filled_ = 0;
+}
+
+void LevelTap::resetBin() {
+    rate_ = 0;
+    window_ = 1;
+    filled_ = 0;
+    inPeak_ = 0.f;
+    outPeak_ = 0.f;
+    inSumSq_ = 0.0;
+    outSumSq_ = 0.0;
+}
+
+void LevelTap::publish(float inPeakDb, float inRmsDb, float outPeakDb, float outRmsDb) {
+    const uint32_t index = write_.load(std::memory_order_relaxed);
+    slots_[index & (kCapacity - 1)].store(encodeFrame(inPeakDb, inRmsDb, outPeakDb, outRmsDb),
+                                          std::memory_order_relaxed);
+    write_.store(index + 1, std::memory_order_release);
+}
+
+int LevelTap::drain(LevelSample* out, int count) {
+    if (!out || count <= 0) {
+        return 0;
+    }
+    const uint32_t write = write_.load(std::memory_order_acquire);
+    uint32_t read = read_;
+    if (write - read > kCapacity - 1) {
+        read = write - (kCapacity - 1);
+    }
+    int copied = 0;
+    while (read != write && copied < count) {
+        const uint64_t bits = slots_[read & (kCapacity - 1)].load(std::memory_order_relaxed);
+        out[copied++] = decodeFrame(bits);
+        ++read;
+    }
+    read_ = read;
+    return copied;
+}
+
+void LevelTap::discard() {
+    read_ = write_.load(std::memory_order_acquire);
 }
 
 void Engine::captureLoop(std::stop_token stop, std::wstring deviceId) {
@@ -748,11 +920,13 @@ void Engine::captureLoop(std::stop_token stop, std::wstring deviceId) {
                         converted[i * 2 + 1] = mono;
                     }
                 }
-                float peak = 0.f;
-                for (uint32_t i = 0; i < frames; ++i) {
-                    peak = std::max(peak, std::max(std::abs(converted[i * 2]), std::abs(converted[i * 2 + 1])));
+                if (!nvidiaNoise_.load(std::memory_order_relaxed) && !nvidiaRoom_.load(std::memory_order_relaxed)) {
+                    float peak = 0.f;
+                    for (uint32_t i = 0; i < frames; ++i) {
+                        peak = std::max(peak, std::max(std::abs(converted[i * 2]), std::abs(converted[i * 2 + 1])));
+                    }
+                    bumpPeak(inPeak_, peak);
                 }
-                bumpPeak(inPeak_, peak);
             }
             audio.capture->ReleaseBuffer(frames);
             resampled.clear();
@@ -822,6 +996,7 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
 
         if (hold_.load(std::memory_order_acquire)) {
             std::memset(dest, 0, static_cast<size_t>(frames) * audio.format->nBlockAlign);
+            levels_.add(audio.pcm.sampleRate, frames, 0.f, 0.0, 0.f, 0.0);
             audio.render->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT);
             continue;
         }
@@ -838,6 +1013,7 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
         if (!queues_->primed.load() && available < target) {
             outFlags = AUDCLNT_BUFFERFLAGS_SILENT;
             std::memset(dest, 0, static_cast<size_t>(frames) * audio.format->nBlockAlign);
+            levels_.add(audio.pcm.sampleRate, frames, 0.f, 0.0, 0.f, 0.0);
         } else {
             queues_->primed.store(true);
             if (available > target * 4) {
@@ -853,13 +1029,18 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
                 std::fill(block.begin() + static_cast<std::ptrdiff_t>(got * 2),
                           block.begin() + static_cast<std::ptrdiff_t>(frames * 2), 0.f);
             }
-            float inPeak = 0.f;
+            BlockLevel inLevel;
             for (UINT32 i = 0; i < frames; ++i) {
                 left[i] = block[i * 2];
                 right[i] = block[i * 2 + 1];
-                inPeak = std::max(inPeak, std::max(std::abs(left[i]), std::abs(right[i])));
             }
-            bumpPeak(inPeak_, inPeak);
+            if (!paused) {
+                filterInput(left.data(), right.data(), static_cast<int>(frames));
+            }
+            for (UINT32 i = 0; i < frames; ++i) {
+                noteSample(inLevel, left[i], right[i]);
+            }
+            bumpPeak(inPeak_, inLevel.peak);
             if (!paused && chain_) {
                 constexpr int kChunk = 1024;
                 UINT32 done = 0;
@@ -871,16 +1052,17 @@ void Engine::renderLoop(std::stop_token stop, std::wstring deviceId, uint32_t re
                 }
             }
             const float targetGain = gain_.load(std::memory_order_relaxed);
-            float outPeak = 0.f;
+            BlockLevel outLevel;
             const int stride = audio.pcm.bytesPerSample * audio.pcm.channels;
             for (UINT32 i = 0; i < frames; ++i) {
                 smoothed += (targetGain - smoothed) * coeff;
                 const float l = left[i] * smoothed;
                 const float r = right[i] * smoothed;
-                outPeak = std::max(outPeak, std::max(std::abs(l), std::abs(r)));
+                noteSample(outLevel, l, r);
                 writeFloat(dest + static_cast<size_t>(i) * stride, l, r, audio.pcm);
             }
-            bumpPeak(outPeak_, outPeak);
+            bumpPeak(outPeak_, outLevel.peak);
+            levels_.add(audio.pcm.sampleRate, frames, inLevel.peak, inLevel.sumSq, outLevel.peak, outLevel.sumSq);
         }
         audio.render->ReleaseBuffer(frames, outFlags);
     }
@@ -1006,13 +1188,18 @@ void Engine::fileLoop(std::stop_token stop, std::wstring path, uint32_t requeste
         }
 
         queues_->queue.pull(block.data(), frames);
-        float inPeak = 0.f;
+        BlockLevel inLevel;
         for (uint32_t i = 0; i < frames; ++i) {
             left[i] = block[i * 2];
             right[i] = block[i * 2 + 1];
-            inPeak = std::max(inPeak, std::max(std::abs(left[i]), std::abs(right[i])));
         }
-        bumpPeak(inPeak_, inPeak);
+        if (!paused) {
+            filterInput(left.data(), right.data(), static_cast<int>(frames));
+        }
+        for (uint32_t i = 0; i < frames; ++i) {
+            noteSample(inLevel, left[i], right[i]);
+        }
+        bumpPeak(inPeak_, inLevel.peak);
         if (!paused && chain_) {
             constexpr int kChunk = 1024;
             uint32_t done = 0;
@@ -1024,14 +1211,15 @@ void Engine::fileLoop(std::stop_token stop, std::wstring path, uint32_t requeste
             }
         }
         const float targetGain = gain_.load(std::memory_order_relaxed);
-        float outPeak = 0.f;
+        BlockLevel outLevel;
         for (uint32_t i = 0; i < frames; ++i) {
             smoothed += (targetGain - smoothed) * coeff;
             left[i] *= smoothed;
             right[i] *= smoothed;
-            outPeak = std::max(outPeak, std::max(std::abs(left[i]), std::abs(right[i])));
+            noteSample(outLevel, left[i], right[i]);
         }
-        bumpPeak(outPeak_, outPeak);
+        bumpPeak(outPeak_, outLevel.peak);
+        levels_.add(rate, frames, inLevel.peak, inLevel.sumSq, outLevel.peak, outLevel.sumSq);
         if (!wav.write(left.data(), right.data(), frames)) {
             std::lock_guard lock(faultMu_);
             fault_ = "Writing the WAV file failed.";

@@ -4,6 +4,7 @@
 #include "audio/Engine.h"
 #include "plugins/Scanner.h"
 #include "ui/EditorFrame.h"
+#include "ui/LevelFile.h"
 #include "ui/Widgets.h"
 
 #include <memory>
@@ -63,6 +64,11 @@ private:
     void SetStatus(const wxString& text, bool error);
     void UpdateRun();
     void OnTick();
+    void ApplyNvidia(bool showStatus);
+    void StartLevelLog();
+    void StopLevelLog();
+    void WriteLevelLog(const LevelSample* samples, int count);
+    void LoadLevelHistoryFile();
     int SelectedInput() const;
     int SelectedOutput() const;
     bool OutputIsVirtual() const;
@@ -85,6 +91,14 @@ private:
     MeterBar* outputMeter_ = nullptr;
     VuMeter* inputVu_ = nullptr;
     VuMeter* outputVu_ = nullptr;
+    LevelHistory* levelHistory_ = nullptr;
+    CheckBox* historyFreeze_ = nullptr;
+    CheckBox* noiseBox_ = nullptr;
+    CheckBox* roomBox_ = nullptr;
+    StrengthSlider* strength_ = nullptr;
+    wxStaticText* strengthValue_ = nullptr;
+    FlatButton* levelRecord_ = nullptr;
+    LevelLogWriter levelLog_;
     wxStaticText* hint_ = nullptr;
     wxStaticText* status_ = nullptr;
     wxStaticText* gainLabel_ = nullptr;

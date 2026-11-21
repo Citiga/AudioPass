@@ -113,6 +113,20 @@ Session loadSession() {
             session.outputId = widen(rest(line, 7));
         } else if (line.rfind("file=", 0) == 0) {
             session.outputFile = widen(rest(line, 5));
+        } else if (line.rfind("levelLog=", 0) == 0) {
+            session.levelLogDir = widen(rest(line, 9));
+        } else if (line.rfind("levelLogBinary=", 0) == 0) {
+            session.levelLogBinary = rest(line, 15) == "1";
+        } else if (line.rfind("nvNoise=", 0) == 0) {
+            session.nvNoise = rest(line, 8) == "1";
+        } else if (line.rfind("nvRoom=", 0) == 0) {
+            session.nvRoom = rest(line, 7) == "1";
+        } else if (line.rfind("nvStrength=", 0) == 0) {
+            session.nvStrength = std::stoi(rest(line, 11));
+        } else if (line.rfind("levelFloor=", 0) == 0) {
+            session.levelFloorDb = std::stoi(rest(line, 11));
+        } else if (line.rfind("levelTrace=", 0) == 0) {
+            session.levelTrace = std::stoi(rest(line, 11));
         } else if (line.rfind("buffer=", 0) == 0) {
             session.bufferFrames = std::stoi(rest(line, 7));
         } else if (line.rfind("gain=", 0) == 0) {
@@ -175,6 +189,15 @@ Session loadSession() {
     if (session.bufferFrames != 128 && session.bufferFrames != 256 && session.bufferFrames != 512) {
         session.bufferFrames = 256;
     }
+    if (session.levelFloorDb != 60 && session.levelFloorDb != 36 && session.levelFloorDb != 24) {
+        session.levelFloorDb = 60;
+    }
+    if (session.levelTrace < 0 || session.levelTrace > 2) {
+        session.levelTrace = 0;
+    }
+    if (session.nvStrength < 0 || session.nvStrength > 100) {
+        session.nvStrength = 100;
+    }
     return session;
 }
 
@@ -186,6 +209,13 @@ void saveSession(const Session& session) {
     out << "input=" << narrow(session.inputId) << "\n";
     out << "output=" << narrow(session.outputId) << "\n";
     out << "file=" << narrow(session.outputFile) << "\n";
+    out << "levelLog=" << narrow(session.levelLogDir) << "\n";
+    out << "levelLogBinary=" << (session.levelLogBinary ? "1" : "0") << "\n";
+    out << "nvNoise=" << (session.nvNoise ? "1" : "0") << "\n";
+    out << "nvRoom=" << (session.nvRoom ? "1" : "0") << "\n";
+    out << "nvStrength=" << session.nvStrength << "\n";
+    out << "levelFloor=" << session.levelFloorDb << "\n";
+    out << "levelTrace=" << session.levelTrace << "\n";
     out << "buffer=" << session.bufferFrames << "\n";
     out << "gain=" << session.gainDb << "\n";
     out << "mono=" << (session.inputMono ? "1" : "0") << "\n";

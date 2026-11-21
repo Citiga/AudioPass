@@ -17,6 +17,13 @@ struct Session {
     std::wstring inputId;
     std::wstring outputId;
     std::wstring outputFile;
+    std::wstring levelLogDir;
+    bool levelLogBinary = false;
+    bool nvNoise = false;
+    bool nvRoom = false;
+    int nvStrength = 100;
+    int levelFloorDb = 60;
+    int levelTrace = 0;
     int bufferFrames = 256;
     float gainDb = 0.f;
     bool inputMono = false;
